@@ -128,11 +128,11 @@ class Trader:
         TOMATOES_SPREAD = 5
         RETREAT = 0.01
 
+        init_product_data(data, product, {"ema": None})
+
         order_depth = state.order_depths[product]
         if not order_depth.buy_orders or not order_depth.sell_orders:
             return []
-
-        init_product_data(data, product, {"ema": None})
 
         position = state.position.get(product, 0)
         limit = self.LIMITS[product]
@@ -152,6 +152,201 @@ class Trader:
             product, order_depth, fair_value, position, limit,
             spread=TOMATOES_SPREAD, retreat=RETREAT
         )
+    
+    def strategy_option(self, voucher, underlying, strike, tte_years, state, data):
+        IV_WINDOW = 50
+        IV_ENTRY_THRESHOLD = 0.02
 
-    def bid(self):
-    	return 15  # UPDATE in Round 2 with actual bid value
+        init_product_data(data, voucher, {"iv_history": []})
+
+        u_depth = state.order_depths.get(underlying)
+        if not u_depth or not u_depth.buy_orders or not u_depth.sell_orders:
+            return [], []
+        S = (max(u_depth.buy_orders.keys()) + min(u_depth.sell_orders.keys())) / 2
+
+        v_depth = state.order_depths.get(voucher)
+        if not v_depth or not v_depth.buy_orders or not v_depth.sell_orders:
+            return [], []
+        option_mid = (max(v_depth.buy_orders.keys()) + min(v_depth.sell_orders.keys())) / 2
+
+        iv = implied_vol(option_mid, S, strike, tte_years, 0)
+        if iv is None:
+            return [], []
+
+        append_capped(data[voucher]["iv_history"], round(iv, 6), IV_WINDOW)
+        iv_hist = data[voucher]["iv_history"]
+        if len(iv_hist) < 20:
+            return [], []
+
+        mean_iv = sum(iv_hist) / len(iv_hist)
+
+        v_position = state.position.get(voucher, 0)
+        v_limit    = self.LIMITS.get(voucher, 50)
+        u_position = state.position.get(underlying, 0)
+        u_limit    = self.LIMITS.get(underlying, 400)
+
+        voucher_orders    = []
+        underlying_orders = []
+
+        if iv > mean_iv + IV_ENTRY_THRESHOLD:
+            sell_budget = v_limit + v_position
+            if sell_budget > 0:
+                best_bid = max(v_depth.buy_orders.keys())
+                qty = min(sell_budget, 5)
+                voucher_orders.append(Order(voucher, int(best_bid), -int(qty)))
+                delta      = bs_delta(S, strike, tte_years, 0, iv)
+                hedge_qty  = min(round(delta * qty), u_limit - u_position)
+                if hedge_qty > 0:
+                    best_ask = min(u_depth.sell_orders.keys())
+                    underlying_orders.append(Order(underlying, int(best_ask), int(hedge_qty)))
+
+        elif iv < mean_iv - IV_ENTRY_THRESHOLD:
+            buy_budget = v_limit - v_position
+            if buy_budget > 0:
+                best_ask = min(v_depth.sell_orders.keys())
+                qty = min(buy_budget, 5)
+                voucher_orders.append(Order(voucher, int(best_ask), int(qty)))
+                delta      = bs_delta(S, strike, tte_years, 0, iv)
+                hedge_qty  = min(round(delta * qty), u_limit + u_position)
+                if hedge_qty > 0:
+                    best_bid = max(u_depth.buy_orders.keys())
+                    underlying_orders.append(Order(underlying, int(best_bid), -int(hedge_qty)))
+
+        return voucher_orders, underlying_orders
+    
+    def track_bots(self, state, data):
+        if "bots" not in data:
+            data["bots"] = {}
+        for product in state.market_trades:
+            for trade in state.market_trades[product]:
+                for actor, is_buy in [(trade.buyer, True), (trade.seller, False)]:
+                    if not actor or actor == "SUBMISSION":
+                        continue
+                    if actor not in data["bots"]:
+                        data["bots"][actor] = {
+                            "buy_count": 0, "sell_count": 0,
+                            "buy_value": 0.0, "sell_value": 0.0,
+                        }
+                    bot = data["bots"][actor]
+                    if is_buy:
+                        bot["buy_count"] += trade.quantity
+                        bot["buy_value"] += trade.price * trade.quantity
+                    else:
+                        bot["sell_count"] += trade.quantity
+                        bot["sell_value"] += trade.price * trade.quantity
+
+    def get_profitable_bots(self, data, min_trades=50):
+        results = []
+        for name, stats in data.get("bots", {}).items():
+            if stats["buy_count"] >= min_trades and stats["sell_count"] >= min_trades:
+                avg_buy = stats["buy_value"] / stats["buy_count"]
+                avg_sell = stats["sell_value"] / stats["sell_count"]
+                edge = avg_sell - avg_buy
+                if edge > 0:
+                    results.append((name, edge))
+        return sorted(results, key=lambda x: -x[1])
+    
+def strategy_basket(self, basket_product, state, data):
+    COMPONENTS = {}   # fill in Round 2 when product specs are known
+    Z_ENTRY = 1.5
+    Z_EXIT  = 0.5
+    HISTORY_LEN = 100
+
+    init_product_data(data, basket_product, {"spread_history": []})
+
+    if not COMPONENTS:
+        return []
+
+    synthetic = 0
+    for component, weight in COMPONENTS.items():
+        if component not in state.order_depths:
+            return []
+        depth = state.order_depths[component]
+        if not depth.buy_orders or not depth.sell_orders:
+            return []
+        comp_mid = (max(depth.buy_orders.keys()) + min(depth.sell_orders.keys())) / 2
+        synthetic += weight * comp_mid
+
+    basket_depth = state.order_depths.get(basket_product)
+    if not basket_depth or not basket_depth.buy_orders or not basket_depth.sell_orders:
+        return []
+    basket_mid = (max(basket_depth.buy_orders.keys()) + min(basket_depth.sell_orders.keys())) / 2
+
+    spread = basket_mid - synthetic
+    append_capped(data[basket_product]["spread_history"], round(spread, 2), HISTORY_LEN)
+
+    history = data[basket_product]["spread_history"]
+    if len(history) < 30:
+        return []
+
+    mean_spread = sum(history) / len(history)
+    variance = sum((x - mean_spread) ** 2 for x in history) / len(history)
+    std_spread = math.sqrt(variance) if variance > 0 else 1
+    z_score = (spread - mean_spread) / std_spread
+
+    position = state.position.get(basket_product, 0)
+    limit = self.LIMITS.get(basket_product, 50)
+    orders = []
+
+    if z_score > Z_ENTRY:
+        sell_budget = limit + position
+        if sell_budget > 0:
+            best_bid = max(basket_depth.buy_orders.keys())
+            qty = min(sell_budget, basket_depth.buy_orders[best_bid])
+            if qty > 0:
+                orders.append(Order(basket_product, int(best_bid), -int(qty)))
+
+    elif z_score < -Z_ENTRY:
+        buy_budget = limit - position
+        if buy_budget > 0:
+            best_ask = min(basket_depth.sell_orders.keys())
+            qty = min(buy_budget, abs(basket_depth.sell_orders[best_ask]))
+            if qty > 0:
+                orders.append(Order(basket_product, int(best_ask), int(qty)))
+
+    elif abs(z_score) < Z_EXIT and position != 0:
+        if position > 0:
+            best_bid = max(basket_depth.buy_orders.keys())
+            orders.append(Order(basket_product, int(best_bid), -int(position)))
+        else:
+            best_ask = min(basket_depth.sell_orders.keys())
+            orders.append(Order(basket_product, int(best_ask), -int(position)))
+
+    return orders
+
+# ── Black-Scholes + implied vol ────────────────────────────────────────────────
+
+def bs_call_price(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
+
+def bs_delta(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return norm_cdf(d1)
+
+def bs_vega(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return S * norm_pdf(d1) * math.sqrt(T)
+
+def implied_vol(market_price, S, K, T, r, tol=1e-6, max_iter=100):
+    if market_price <= 0 or T <= 0:
+        return None
+    sigma = 0.2
+    for _ in range(max_iter):
+        price = bs_call_price(S, K, T, r, sigma)
+        vega  = bs_vega(S, K, T, r, sigma)
+        if abs(vega) < 1e-10:
+            break
+        sigma = sigma - (price - market_price) / vega
+        sigma = max(sigma, 0.001)
+        if abs(bs_call_price(S, K, T, r, sigma) - market_price) < tol:
+            return sigma
+    return sigma if abs(bs_call_price(S, K, T, r, sigma) - market_price) < 1.0 else None
+

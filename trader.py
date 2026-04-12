@@ -92,6 +92,12 @@ class Trader:
         "TOMATOES": 80,
     }
 
+    # SWEEP PARAMS - do not rename these lines
+    EMERALDS_SPREAD = 3
+    TOMATOES_ALPHA  = 0.15
+    TOMATOES_SPREAD = 5
+    TOMATOES_RETREAT = 0.02
+
     # EMERALDS: stable product. Verify exact fair value from tutorial data.
     EMERALDS_FAIR_VALUE = 10000  # UPDATE after running analysis notebook on tutorial data
 
@@ -111,7 +117,7 @@ class Trader:
         return result, conversions, traderData
 
     def strategy_stable(self, product, state, data):
-        EMERALDS_SPREAD = 3
+        EMERALDS_SPREAD = self.EMERALDS_SPREAD
 
         order_depth = state.order_depths[product]
         if not order_depth.buy_orders or not order_depth.sell_orders:
@@ -124,9 +130,9 @@ class Trader:
         )
 
     def strategy_ema(self, product, state, data):
-        EMA_ALPHA = 0.12
-        TOMATOES_SPREAD = 5
-        RETREAT = 0.01
+        EMA_ALPHA = self.TOMATOES_ALPHA
+        TOMATOES_SPREAD = self.TOMATOES_SPREAD
+        RETREAT = self.TOMATOES_RETREAT
 
         init_product_data(data, product, {"ema": None})
 

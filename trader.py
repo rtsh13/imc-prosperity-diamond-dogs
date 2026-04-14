@@ -125,17 +125,17 @@ def compute_wall_mid(order_depth):
 class Trader:
 
     LIMITS = {
-        "EMERALDS": 80,
-        "TOMATOES": 80,
+        "ASH_COATED_OSMIUM": 80,
+        "INTARIAN_PEPPER_ROOT": 80,
     }
 
     # SWEEP PARAMS - do not rename these lines
-    EMERALDS_SPREAD  = 3
-    TOMATOES_ALPHA   = 0.15
-    TOMATOES_SPREAD  = 5
-    TOMATOES_RETREAT = 0.02
+    ASH_COATED_OSMIUM_SPREAD  = 6
+    #INTARIAN_PEPPER_ROOT_ALPHA   = 0.15
+    # INTARIAN_PEPPER_ROOT_SPREAD  = 4
+    # INTARIAN_PEPPER_ROOT_RETREAT = 0.01
 
-    EMERALDS_FAIR_VALUE = 10000
+    ASH_COATED_OSMIUM_FAIR_VALUE = 10000
 
     def run(self, state: TradingState):
         result = {}
@@ -144,14 +144,38 @@ class Trader:
         # BUG 2 FIX: json.loads("null") returns None; `or {}` guards that case
         data = (json.loads(state.traderData) if state.traderData else None) or {}
 
-        if "EMERALDS" in state.order_depths:
-            result["EMERALDS"] = self.strategy_stable("EMERALDS", state, data)
+        if "ASH_COATED_OSMIUM" in state.order_depths:
+            result["ASH_COATED_OSMIUM"] = self.strategy_stable("ASH_COATED_OSMIUM", state, data)
 
-        if "TOMATOES" in state.order_depths:
-            result["TOMATOES"] = self.strategy_ema("TOMATOES", state, data)
+        if "INTARIAN_PEPPER_ROOT" in state.order_depths:
+            result["INTARIAN_PEPPER_ROOT"] = self.strategy_ipr("INTARIAN_PEPPER_ROOT", state, data)
 
         traderData = json.dumps(data)
         return result, conversions, traderData
+    
+    def strategy_ipr(self, product, state, data):
+        order_depth = state.order_depths[product]
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return []
+        position = state.position.get(product, 0)
+        limit = self.LIMITS.get(product)
+        if limit is None:
+            return []
+        buy_budget = limit - position
+        if buy_budget <= 0:
+            return []
+        orders = []
+        # Hit every ask on the book until we reach max long position.
+        # Never post asks. Directional gain >> spread cost.
+        for price in sorted(order_depth.sell_orders.keys()):
+            if buy_budget <= 0:
+                break
+            available = -order_depth.sell_orders[price]
+            qty = min(available, buy_budget)
+            if qty > 0:
+                orders.append(Order(product, int(price), int(qty)))
+                buy_budget -= qty
+        return orders
 
     def strategy_stable(self, product, state, data):
         order_depth = state.order_depths[product]
@@ -161,9 +185,10 @@ class Trader:
         limit = self.LIMITS.get(product)
         if limit is None:
             return []
+        fair = compute_wall_mid(order_depth) or self.ASH_COATED_OSMIUM_FAIR_VALUE
         return compute_orders_with_budget(
-            product, order_depth, self.EMERALDS_FAIR_VALUE, position, limit,
-            spread=self.EMERALDS_SPREAD, retreat=0.0
+            product, order_depth, fair, position, limit,
+            spread=self.ASH_COATED_OSMIUM_SPREAD, retreat=0.0
         )
 
     def strategy_ema(self, product, state, data):
@@ -185,11 +210,11 @@ class Trader:
         if data[product]["ema"] is None:
             data[product]["ema"] = mid
         else:
-            data[product]["ema"] = self.TOMATOES_ALPHA * mid + (1 - self.TOMATOES_ALPHA) * data[product]["ema"]
+            data[product]["ema"] = self.INTARIAN_PEPPER_ROOT_ALPHA * mid + (1 - self.INTARIAN_PEPPER_ROOT_ALPHA) * data[product]["ema"]
 
         return compute_orders_with_budget(
             product, order_depth, data[product]["ema"], position, limit,
-            spread=self.TOMATOES_SPREAD, retreat=self.TOMATOES_RETREAT
+            spread=self.INTARIAN_PEPPER_ROOT_SPREAD, retreat=self.INTARIAN_PEPPER_ROOT_RETREAT
         )
 
     def strategy_basket(self, basket_product, state, data):

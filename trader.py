@@ -17,6 +17,43 @@ def norm_pdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
 
+# ── Black-Scholes + implied vol ────────────────────────────────────────────────
+
+def bs_call_price(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
+
+def bs_delta(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return norm_cdf(d1)
+
+def bs_vega(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return S * norm_pdf(d1) * math.sqrt(T)
+
+def implied_vol(market_price, S, K, T, r, tol=1e-6, max_iter=100):
+    if market_price <= 0 or T <= 0:
+        return None
+    sigma = 0.2
+    for _ in range(max_iter):
+        price = bs_call_price(S, K, T, r, sigma)
+        vega  = bs_vega(S, K, T, r, sigma)
+        if abs(vega) < 1e-10:
+            break
+        sigma = sigma - (price - market_price) / vega
+        sigma = max(sigma, 0.001)
+        if abs(bs_call_price(S, K, T, r, sigma) - market_price) < tol:
+            return sigma
+    return sigma if abs(bs_call_price(S, K, T, r, sigma) - market_price) < 1.0 else None
+
+
 # ── State serialization ────────────────────────────────────────────────────────
 
 def init_product_data(data, product, defaults=None):
@@ -46,7 +83,7 @@ def compute_orders_with_budget(product, order_depth, fair_value, position, limit
     if order_depth.sell_orders:
         for price in sorted(order_depth.sell_orders.keys()):
             if price < theo and buy_budget > 0:
-                available = -order_depth.sell_orders[price]  # negate: volumes are negative
+                available = -order_depth.sell_orders[price]
                 qty = min(available, buy_budget)
                 if qty > 0:
                     orders.append(Order(product, int(price), int(qty)))
@@ -93,19 +130,19 @@ class Trader:
     }
 
     # SWEEP PARAMS - do not rename these lines
-    EMERALDS_SPREAD = 3
-    TOMATOES_ALPHA  = 0.15
-    TOMATOES_SPREAD = 5
+    EMERALDS_SPREAD  = 3
+    TOMATOES_ALPHA   = 0.15
+    TOMATOES_SPREAD  = 5
     TOMATOES_RETREAT = 0.02
 
-    # EMERALDS: stable product. Verify exact fair value from tutorial data.
-    EMERALDS_FAIR_VALUE = 10000  # UPDATE after running analysis notebook on tutorial data
+    EMERALDS_FAIR_VALUE = 10000
 
     def run(self, state: TradingState):
         result = {}
         conversions = 0
 
-        data = json.loads(state.traderData) if state.traderData else {}
+        # BUG 2 FIX: json.loads("null") returns None; `or {}` guards that case
+        data = (json.loads(state.traderData) if state.traderData else None) or {}
 
         if "EMERALDS" in state.order_depths:
             result["EMERALDS"] = self.strategy_stable("EMERALDS", state, data)
@@ -117,8 +154,6 @@ class Trader:
         return result, conversions, traderData
 
     def strategy_stable(self, product, state, data):
-        EMERALDS_SPREAD = self.EMERALDS_SPREAD
-
         order_depth = state.order_depths[product]
         if not order_depth.buy_orders or not order_depth.sell_orders:
             return []
@@ -126,14 +161,10 @@ class Trader:
         limit = self.LIMITS[product]
         return compute_orders_with_budget(
             product, order_depth, self.EMERALDS_FAIR_VALUE, position, limit,
-            spread=EMERALDS_SPREAD, retreat=0.0
+            spread=self.EMERALDS_SPREAD, retreat=0.0
         )
 
     def strategy_ema(self, product, state, data):
-        EMA_ALPHA = self.TOMATOES_ALPHA
-        TOMATOES_SPREAD = self.TOMATOES_SPREAD
-        RETREAT = self.TOMATOES_RETREAT
-
         init_product_data(data, product, {"ema": None})
 
         order_depth = state.order_depths[product]
@@ -150,17 +181,84 @@ class Trader:
         if data[product]["ema"] is None:
             data[product]["ema"] = mid
         else:
-            data[product]["ema"] = EMA_ALPHA * mid + (1 - EMA_ALPHA) * data[product]["ema"]
-
-        fair_value = data[product]["ema"]
+            data[product]["ema"] = self.TOMATOES_ALPHA * mid + (1 - self.TOMATOES_ALPHA) * data[product]["ema"]
 
         return compute_orders_with_budget(
-            product, order_depth, fair_value, position, limit,
-            spread=TOMATOES_SPREAD, retreat=RETREAT
+            product, order_depth, data[product]["ema"], position, limit,
+            spread=self.TOMATOES_SPREAD, retreat=self.TOMATOES_RETREAT
         )
-    
+
+    def strategy_basket(self, basket_product, state, data):
+        # BUG 1 FIX: was at module level. Now correctly inside Trader class.
+        COMPONENTS  = {}   # fill in Round 2 when product specs are known
+        Z_ENTRY     = 1.5
+        Z_EXIT      = 0.5
+        HISTORY_LEN = 100
+
+        init_product_data(data, basket_product, {"spread_history": []})
+
+        if not COMPONENTS:
+            return []
+
+        synthetic = 0
+        for component, weight in COMPONENTS.items():
+            if component not in state.order_depths:
+                return []
+            depth = state.order_depths[component]
+            if not depth.buy_orders or not depth.sell_orders:
+                return []
+            comp_mid = (max(depth.buy_orders.keys()) + min(depth.sell_orders.keys())) / 2
+            synthetic += weight * comp_mid
+
+        basket_depth = state.order_depths.get(basket_product)
+        if not basket_depth or not basket_depth.buy_orders or not basket_depth.sell_orders:
+            return []
+        basket_mid = (max(basket_depth.buy_orders.keys()) + min(basket_depth.sell_orders.keys())) / 2
+
+        spread = basket_mid - synthetic
+        append_capped(data[basket_product]["spread_history"], round(spread, 2), HISTORY_LEN)
+
+        history = data[basket_product]["spread_history"]
+        if len(history) < 30:
+            return []
+
+        mean_spread = sum(history) / len(history)
+        variance    = sum((x - mean_spread) ** 2 for x in history) / len(history)
+        std_spread  = math.sqrt(variance) if variance > 0 else 1.0
+        z_score     = (spread - mean_spread) / std_spread
+
+        position = state.position.get(basket_product, 0)
+        limit    = self.LIMITS.get(basket_product, 50)
+        orders   = []
+
+        if z_score > Z_ENTRY:
+            sell_budget = limit + position
+            if sell_budget > 0:
+                best_bid = max(basket_depth.buy_orders.keys())
+                qty = min(sell_budget, basket_depth.buy_orders[best_bid])
+                if qty > 0:
+                    orders.append(Order(basket_product, int(best_bid), -int(qty)))
+
+        elif z_score < -Z_ENTRY:
+            buy_budget = limit - position
+            if buy_budget > 0:
+                best_ask = min(basket_depth.sell_orders.keys())
+                qty = min(buy_budget, abs(basket_depth.sell_orders[best_ask]))
+                if qty > 0:
+                    orders.append(Order(basket_product, int(best_ask), int(qty)))
+
+        elif abs(z_score) < Z_EXIT and position != 0:
+            if position > 0:
+                best_bid = max(basket_depth.buy_orders.keys())
+                orders.append(Order(basket_product, int(best_bid), -int(position)))
+            else:
+                best_ask = min(basket_depth.sell_orders.keys())
+                orders.append(Order(basket_product, int(best_ask), -int(position)))
+
+        return orders
+
     def strategy_option(self, voucher, underlying, strike, tte_years, state, data):
-        IV_WINDOW = 50
+        IV_WINDOW          = 50
         IV_ENTRY_THRESHOLD = 0.02
 
         init_product_data(data, voucher, {"iv_history": []})
@@ -200,8 +298,9 @@ class Trader:
                 best_bid = max(v_depth.buy_orders.keys())
                 qty = min(sell_budget, 5)
                 voucher_orders.append(Order(voucher, int(best_bid), -int(qty)))
-                delta      = bs_delta(S, strike, tte_years, 0, iv)
-                hedge_qty  = min(round(delta * qty), u_limit - u_position)
+                delta     = bs_delta(S, strike, tte_years, 0, iv)
+                # BUG 3 FIX: max(0, ...) prevents negative hedge_qty if u_position >= u_limit
+                hedge_qty = max(0, min(round(delta * qty), u_limit - u_position))
                 if hedge_qty > 0:
                     best_ask = min(u_depth.sell_orders.keys())
                     underlying_orders.append(Order(underlying, int(best_ask), int(hedge_qty)))
@@ -212,14 +311,15 @@ class Trader:
                 best_ask = min(v_depth.sell_orders.keys())
                 qty = min(buy_budget, 5)
                 voucher_orders.append(Order(voucher, int(best_ask), int(qty)))
-                delta      = bs_delta(S, strike, tte_years, 0, iv)
-                hedge_qty  = min(round(delta * qty), u_limit + u_position)
+                delta     = bs_delta(S, strike, tte_years, 0, iv)
+                # BUG 3 FIX: max(0, ...) prevents negative hedge_qty if u_position <= -u_limit
+                hedge_qty = max(0, min(round(delta * qty), u_limit + u_position))
                 if hedge_qty > 0:
                     best_bid = max(u_depth.buy_orders.keys())
                     underlying_orders.append(Order(underlying, int(best_bid), -int(hedge_qty)))
 
         return voucher_orders, underlying_orders
-    
+
     def track_bots(self, state, data):
         if "bots" not in data:
             data["bots"] = {}
@@ -245,114 +345,9 @@ class Trader:
         results = []
         for name, stats in data.get("bots", {}).items():
             if stats["buy_count"] >= min_trades and stats["sell_count"] >= min_trades:
-                avg_buy = stats["buy_value"] / stats["buy_count"]
+                avg_buy  = stats["buy_value"] / stats["buy_count"]
                 avg_sell = stats["sell_value"] / stats["sell_count"]
-                edge = avg_sell - avg_buy
+                edge     = avg_sell - avg_buy
                 if edge > 0:
                     results.append((name, edge))
         return sorted(results, key=lambda x: -x[1])
-    
-def strategy_basket(self, basket_product, state, data):
-    COMPONENTS = {}   # fill in Round 2 when product specs are known
-    Z_ENTRY = 1.5
-    Z_EXIT  = 0.5
-    HISTORY_LEN = 100
-
-    init_product_data(data, basket_product, {"spread_history": []})
-
-    if not COMPONENTS:
-        return []
-
-    synthetic = 0
-    for component, weight in COMPONENTS.items():
-        if component not in state.order_depths:
-            return []
-        depth = state.order_depths[component]
-        if not depth.buy_orders or not depth.sell_orders:
-            return []
-        comp_mid = (max(depth.buy_orders.keys()) + min(depth.sell_orders.keys())) / 2
-        synthetic += weight * comp_mid
-
-    basket_depth = state.order_depths.get(basket_product)
-    if not basket_depth or not basket_depth.buy_orders or not basket_depth.sell_orders:
-        return []
-    basket_mid = (max(basket_depth.buy_orders.keys()) + min(basket_depth.sell_orders.keys())) / 2
-
-    spread = basket_mid - synthetic
-    append_capped(data[basket_product]["spread_history"], round(spread, 2), HISTORY_LEN)
-
-    history = data[basket_product]["spread_history"]
-    if len(history) < 30:
-        return []
-
-    mean_spread = sum(history) / len(history)
-    variance = sum((x - mean_spread) ** 2 for x in history) / len(history)
-    std_spread = math.sqrt(variance) if variance > 0 else 1
-    z_score = (spread - mean_spread) / std_spread
-
-    position = state.position.get(basket_product, 0)
-    limit = self.LIMITS.get(basket_product, 50)
-    orders = []
-
-    if z_score > Z_ENTRY:
-        sell_budget = limit + position
-        if sell_budget > 0:
-            best_bid = max(basket_depth.buy_orders.keys())
-            qty = min(sell_budget, basket_depth.buy_orders[best_bid])
-            if qty > 0:
-                orders.append(Order(basket_product, int(best_bid), -int(qty)))
-
-    elif z_score < -Z_ENTRY:
-        buy_budget = limit - position
-        if buy_budget > 0:
-            best_ask = min(basket_depth.sell_orders.keys())
-            qty = min(buy_budget, abs(basket_depth.sell_orders[best_ask]))
-            if qty > 0:
-                orders.append(Order(basket_product, int(best_ask), int(qty)))
-
-    elif abs(z_score) < Z_EXIT and position != 0:
-        if position > 0:
-            best_bid = max(basket_depth.buy_orders.keys())
-            orders.append(Order(basket_product, int(best_bid), -int(position)))
-        else:
-            best_ask = min(basket_depth.sell_orders.keys())
-            orders.append(Order(basket_product, int(best_ask), -int(position)))
-
-    return orders
-
-# ── Black-Scholes + implied vol ────────────────────────────────────────────────
-
-def bs_call_price(S, K, T, r, sigma):
-    if T <= 0 or sigma <= 0:
-        return max(S - K, 0)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
-
-def bs_delta(S, K, T, r, sigma):
-    if T <= 0 or sigma <= 0:
-        return 1.0 if S > K else 0.0
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    return norm_cdf(d1)
-
-def bs_vega(S, K, T, r, sigma):
-    if T <= 0 or sigma <= 0:
-        return 0.0
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    return S * norm_pdf(d1) * math.sqrt(T)
-
-def implied_vol(market_price, S, K, T, r, tol=1e-6, max_iter=100):
-    if market_price <= 0 or T <= 0:
-        return None
-    sigma = 0.2
-    for _ in range(max_iter):
-        price = bs_call_price(S, K, T, r, sigma)
-        vega  = bs_vega(S, K, T, r, sigma)
-        if abs(vega) < 1e-10:
-            break
-        sigma = sigma - (price - market_price) / vega
-        sigma = max(sigma, 0.001)
-        if abs(bs_call_price(S, K, T, r, sigma) - market_price) < tol:
-            return sigma
-    return sigma if abs(bs_call_price(S, K, T, r, sigma) - market_price) < 1.0 else None
-

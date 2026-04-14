@@ -158,7 +158,9 @@ class Trader:
         if not order_depth.buy_orders or not order_depth.sell_orders:
             return []
         position = state.position.get(product, 0)
-        limit = self.LIMITS[product]
+        limit = self.LIMITS.get(product)
+        if limit is None:
+            return []
         return compute_orders_with_budget(
             product, order_depth, self.EMERALDS_FAIR_VALUE, position, limit,
             spread=self.EMERALDS_SPREAD, retreat=0.0
@@ -172,7 +174,9 @@ class Trader:
             return []
 
         position = state.position.get(product, 0)
-        limit = self.LIMITS[product]
+        limit = self.LIMITS.get(product)
+        if limit is None:
+            return []
 
         best_bid = max(order_depth.buy_orders.keys())
         best_ask = min(order_depth.sell_orders.keys())

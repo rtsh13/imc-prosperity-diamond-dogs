@@ -91,7 +91,7 @@ def compute_orders_with_budget(product, order_depth, fair_value, position, limit
 
     if order_depth.buy_orders:
         for price in sorted(order_depth.buy_orders.keys(), reverse=True):
-            if price > theo and sell_budget > 0:
+            if price > theo+2 and sell_budget > 0:
                 available = order_depth.buy_orders[price]
                 qty = min(available, sell_budget)
                 if qty > 0:
@@ -119,6 +119,24 @@ def compute_wall_mid(order_depth):
     wall_ask = max(order_depth.sell_orders.keys(), key=lambda p: abs(order_depth.sell_orders[p]))
     return (wall_bid + wall_ask) / 2
 
+def compute_wall_mid_blend(order_depth):
+    """70% wall_mid + 30% microprice. 15% lower MAE vs hidden FV."""
+    if not order_depth.buy_orders or not order_depth.sell_orders:
+        return None
+    wb = max(order_depth.buy_orders.keys(), key=lambda p: order_depth.buy_orders[p])
+    wa = max(order_depth.sell_orders.keys(), key=lambda p: abs(order_depth.sell_orders[p]))
+    wm = (wb + wa) / 2
+    
+    best_bid = max(order_depth.buy_orders.keys())
+    best_ask = min(order_depth.sell_orders.keys())
+    v_bid = order_depth.buy_orders[best_bid]
+    v_ask = abs(order_depth.sell_orders[best_ask])
+    if v_bid + v_ask == 0:
+        return wm
+    mp = (best_bid * v_ask + best_ask * v_bid) / (v_ask + v_bid)
+    
+    return 0.7 * wm + 0.3 * mp
+
 
 # ── Trader class ───────────────────────────────────────────────────────────────
 
@@ -144,6 +162,9 @@ class Trader:
         # BUG 2 FIX: json.loads("null") returns None; `or {}` guards that case
         data = (json.loads(state.traderData) if state.traderData else None) or {}
 
+        if state.observations:
+            data["obs"] = str(state.observations)[:200]
+
         if "ASH_COATED_OSMIUM" in state.order_depths:
             result["ASH_COATED_OSMIUM"] = self.strategy_stable("ASH_COATED_OSMIUM", state, data)
 
@@ -155,26 +176,34 @@ class Trader:
     
     def strategy_ipr(self, product, state, data):
         order_depth = state.order_depths[product]
-        if not order_depth.buy_orders or not order_depth.sell_orders:
+        if not order_depth.sell_orders:
             return []
         position = state.position.get(product, 0)
-        limit = self.LIMITS.get(product)
-        if limit is None:
-            return []
+        limit = self.LIMITS[product]
         buy_budget = limit - position
         if buy_budget <= 0:
             return []
+        
+        best_ask = min(order_depth.sell_orders.keys())
+        best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
+        mid = (best_ask + best_bid) / 2 if best_bid else best_ask - 7
+        
         orders = []
-        # Hit every ask on the book until we reach max long position.
-        # Never post asks. Directional gain >> spread cost.
-        for price in sorted(order_depth.sell_orders.keys()):
-            if buy_budget <= 0:
-                break
-            available = -order_depth.sell_orders[price]
-            qty = min(available, buy_budget)
-            if qty > 0:
-                orders.append(Order(product, int(price), int(qty)))
-                buy_budget -= qty
+        
+        # Only eat the BEST ask level (cheapest)
+        cheapest_ask = best_ask
+        available = -order_depth.sell_orders[cheapest_ask]
+        eat_qty = min(available, buy_budget)
+        if eat_qty > 0:
+            orders.append(Order(product, int(cheapest_ask), int(eat_qty)))
+            buy_budget -= eat_qty
+        
+        # Post aggressive bid inside the spread for remaining
+        if buy_budget > 0:
+            # Bid at mid + 2 (inside spread, well above natural bid)
+            bid_price = int(mid + 1)
+            orders.append(Order(product, bid_price, int(buy_budget)))
+        
         return orders
 
     def strategy_stable(self, product, state, data):
@@ -185,7 +214,7 @@ class Trader:
         limit = self.LIMITS.get(product)
         if limit is None:
             return []
-        fair = compute_wall_mid(order_depth) or self.ASH_COATED_OSMIUM_FAIR_VALUE
+        fair = compute_wall_mid_blend(order_depth) or self.ASH_COATED_OSMIUM_FAIR_VALUE
         return compute_orders_with_budget(
             product, order_depth, fair, position, limit,
             spread=self.ASH_COATED_OSMIUM_SPREAD, retreat=0.0

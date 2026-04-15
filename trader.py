@@ -68,7 +68,7 @@ def append_capped(lst, value, max_len=50):
 
 # ── Position budget + order placement ─────────────────────────────────────────
 
-def compute_orders_with_budget(product, order_depth, fair_value, position, limit, spread=2.0, retreat=0.0):
+def compute_orders_with_budget(product, order_depth, fair_value, position, limit, spread=2.0, retreat=0.0, sell_offset=2):
     """
     sell_orders volumes are NEGATIVE (verified from runner.py).
     Order price and quantity must be int (verified from type_check_orders).
@@ -91,7 +91,7 @@ def compute_orders_with_budget(product, order_depth, fair_value, position, limit
 
     if order_depth.buy_orders:
         for price in sorted(order_depth.buy_orders.keys(), reverse=True):
-            if price > theo+2 and sell_budget > 0:
+            if price > theo + sell_offset and sell_budget > 0:
                 available = order_depth.buy_orders[price]
                 qty = min(available, sell_budget)
                 if qty > 0:
@@ -152,6 +152,9 @@ class Trader:
     #INTARIAN_PEPPER_ROOT_ALPHA   = 0.15
     # INTARIAN_PEPPER_ROOT_SPREAD  = 4
     # INTARIAN_PEPPER_ROOT_RETREAT = 0.01
+    ASH_COATED_OSMIUM_SELL_OFFSET = 2 # best 2
+    ASH_COATED_OSMIUM_WALL_WEIGHT = 0.9
+    IPR_BID_OFFSET = 0
 
     ASH_COATED_OSMIUM_FAIR_VALUE = 10000
 
@@ -201,7 +204,7 @@ class Trader:
         # Post aggressive bid inside the spread for remaining
         if buy_budget > 0:
             # Bid at mid + 2 (inside spread, well above natural bid)
-            bid_price = int(mid + 1)
+            bid_price = int(mid + self.IPR_BID_OFFSET)
             orders.append(Order(product, bid_price, int(buy_budget)))
         
         return orders
@@ -214,10 +217,22 @@ class Trader:
         limit = self.LIMITS.get(product)
         if limit is None:
             return []
-        fair = compute_wall_mid_blend(order_depth) or self.ASH_COATED_OSMIUM_FAIR_VALUE
+        
+        w = self.ASH_COATED_OSMIUM_WALL_WEIGHT
+        wb = max(order_depth.buy_orders.keys(), key=lambda p: order_depth.buy_orders[p])
+        wa = max(order_depth.sell_orders.keys(), key=lambda p: abs(order_depth.sell_orders[p]))
+        wm = (wb + wa) / 2
+        best_bid = max(order_depth.buy_orders.keys())
+        best_ask = min(order_depth.sell_orders.keys())
+        v_bid = order_depth.buy_orders[best_bid]
+        v_ask = abs(order_depth.sell_orders[best_ask])
+        mp = (best_bid * v_ask + best_ask * v_bid) / (v_ask + v_bid) if (v_bid + v_ask) > 0 else wm
+        fair = w * wm + (1 - w) * mp
+        
         return compute_orders_with_budget(
             product, order_depth, fair, position, limit,
-            spread=self.ASH_COATED_OSMIUM_SPREAD, retreat=0.0
+            spread=self.ASH_COATED_OSMIUM_SPREAD, retreat=0.0,
+            sell_offset=self.ASH_COATED_OSMIUM_SELL_OFFSET
         )
 
     def strategy_ema(self, product, state, data):

@@ -158,6 +158,11 @@ class Trader:
 
     ASH_COATED_OSMIUM_FAIR_VALUE = 10000
 
+    MAF_BID = 1500
+
+    def bid(self):
+        return self.MAF_BID
+
     def run(self, state: TradingState):
         result = {}
         conversions = 0

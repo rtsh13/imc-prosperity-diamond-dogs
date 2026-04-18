@@ -148,17 +148,17 @@ class Trader:
     }
 
     # SWEEP PARAMS - do not rename these lines
-    ASH_COATED_OSMIUM_SPREAD  = 6
+    ASH_COATED_OSMIUM_SPREAD  = 6 # best 6
     #INTARIAN_PEPPER_ROOT_ALPHA   = 0.15
     # INTARIAN_PEPPER_ROOT_SPREAD  = 4
     # INTARIAN_PEPPER_ROOT_RETREAT = 0.01
-    ASH_COATED_OSMIUM_SELL_OFFSET = 2 # best 2
+    ASH_COATED_OSMIUM_SELL_OFFSET = -1 # best 2
     ASH_COATED_OSMIUM_WALL_WEIGHT = 0.9
     IPR_BID_OFFSET = 0
 
     ASH_COATED_OSMIUM_FAIR_VALUE = 10000
 
-    MAF_BID = 1500
+    MAF_BID = 2500 # was 1500
 
     def bid(self):
         return self.MAF_BID

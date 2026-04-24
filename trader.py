@@ -148,17 +148,19 @@ class Trader:
     }
 
     # SWEEP PARAMS - do not rename these lines
-    ASH_COATED_OSMIUM_SPREAD  = 6 # best 6
+    ASH_COATED_OSMIUM_SPREAD  = 6  # passive MM spread
     #INTARIAN_PEPPER_ROOT_ALPHA   = 0.15
     # INTARIAN_PEPPER_ROOT_SPREAD  = 4
     # INTARIAN_PEPPER_ROOT_RETREAT = 0.01
-    ASH_COATED_OSMIUM_SELL_OFFSET = -1 # best 2
+    ASH_COATED_OSMIUM_SELL_OFFSET = 0
     ASH_COATED_OSMIUM_WALL_WEIGHT = 0.9
     IPR_BID_OFFSET = 0
 
     ASH_COATED_OSMIUM_FAIR_VALUE = 10000
+    ASH_TAKE_MARGIN = 3  # aggressive mean-revert take at 10000 +/- 3
 
-    MAF_BID = 2500 # was 1500
+
+    MAF_BID = 1500
 
     def bid(self):
         return self.MAF_BID
@@ -223,6 +225,7 @@ class Trader:
         if limit is None:
             return []
         
+        # passive fair: tracks short-term book state
         w = self.ASH_COATED_OSMIUM_WALL_WEIGHT
         wb = max(order_depth.buy_orders.keys(), key=lambda p: order_depth.buy_orders[p])
         wa = max(order_depth.sell_orders.keys(), key=lambda p: abs(order_depth.sell_orders[p]))
@@ -232,13 +235,61 @@ class Trader:
         v_bid = order_depth.buy_orders[best_bid]
         v_ask = abs(order_depth.sell_orders[best_ask])
         mp = (best_bid * v_ask + best_ask * v_bid) / (v_ask + v_bid) if (v_bid + v_ask) > 0 else wm
-        fair = w * wm + (1 - w) * mp
+        passive_fair = w * wm + (1 - w) * mp
         
-        return compute_orders_with_budget(
-            product, order_depth, fair, position, limit,
-            spread=self.ASH_COATED_OSMIUM_SPREAD, retreat=0.0,
-            sell_offset=self.ASH_COATED_OSMIUM_SELL_OFFSET
-        )
+        # take fair: anchored on TRUE mean (ASH is strongly mean-reverting to 10000)
+        take_fair = self.ASH_COATED_OSMIUM_FAIR_VALUE  # = 10000
+        
+        orders = []
+        buy_budget = limit - position
+        sell_budget = limit + position
+        
+        # Phase 1a: take asks below TAKE_FAIR - K (strong mean-revert buy)
+        if order_depth.sell_orders:
+            for price in sorted(order_depth.sell_orders.keys()):
+                if price <= take_fair - self.ASH_TAKE_MARGIN and buy_budget > 0:
+                    available = -order_depth.sell_orders[price]
+                    qty = min(available, buy_budget)
+                    if qty > 0:
+                        orders.append(Order(product, int(price), int(qty)))
+                        buy_budget -= qty
+        
+        # Phase 1b: take bids above TAKE_FAIR + K (strong mean-revert sell)
+        if order_depth.buy_orders:
+            for price in sorted(order_depth.buy_orders.keys(), reverse=True):
+                if price >= take_fair + self.ASH_TAKE_MARGIN and sell_budget > 0:
+                    available = order_depth.buy_orders[price]
+                    qty = min(available, sell_budget)
+                    if qty > 0:
+                        orders.append(Order(product, int(price), -int(qty)))
+                        sell_budget -= qty
+        
+        # Phase 1c: additional take based on passive_fair (original behavior, catches short-term dislocations)
+        if order_depth.sell_orders:
+            for price in sorted(order_depth.sell_orders.keys()):
+                if price < passive_fair and buy_budget > 0:
+                    available = -order_depth.sell_orders[price]
+                    qty = min(available, buy_budget)
+                    if qty > 0:
+                        orders.append(Order(product, int(price), int(qty)))
+                        buy_budget -= qty
+        if order_depth.buy_orders:
+            for price in sorted(order_depth.buy_orders.keys(), reverse=True):
+                if price > passive_fair + self.ASH_COATED_OSMIUM_SELL_OFFSET and sell_budget > 0:
+                    available = order_depth.buy_orders[price]
+                    qty = min(available, sell_budget)
+                    if qty > 0:
+                        orders.append(Order(product, int(price), -int(qty)))
+                        sell_budget -= qty
+        
+        # Phase 2: passive quotes around passive_fair
+        bid_price = int(math.floor(passive_fair - self.ASH_COATED_OSMIUM_SPREAD))
+        ask_price = int(math.ceil(passive_fair + self.ASH_COATED_OSMIUM_SPREAD))
+        if buy_budget > 0:
+            orders.append(Order(product, bid_price, int(buy_budget)))
+        if sell_budget > 0:
+            orders.append(Order(product, ask_price, -int(sell_budget)))
+        return orders
 
     def strategy_ema(self, product, state, data):
         init_product_data(data, product, {"ema": None})

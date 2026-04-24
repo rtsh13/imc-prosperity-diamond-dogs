@@ -145,6 +145,14 @@ class Trader:
     LIMITS = {
         "ASH_COATED_OSMIUM": 80,
         "INTARIAN_PEPPER_ROOT": 80,
+        "HYDROGEL_PACK": 200,
+        "VELVETFRUIT_EXTRACT": 200,
+        "VEV_5000": 300,
+        "VEV_5100": 300,
+        "VEV_5200": 300,
+        "VEV_5300": 300,
+        "VEV_5400": 300,
+        "VEV_5500": 300,
     }
 
     # SWEEP PARAMS - do not rename these lines
@@ -162,14 +170,43 @@ class Trader:
 
     MAF_BID = 1500
 
+    # R3 delta-1 MM params
+    HYDROGEL_PACK_SPREAD       = 4
+    HYDROGEL_PACK_SELL_OFFSET  = 0
+    HYDROGEL_PACK_TAKE_MARGIN  = 8   # 0.27 sigma of std=30; prevents false takes on anchor error
+
+    VELVETFRUIT_EXTRACT_SPREAD      = 2
+    VELVETFRUIT_EXTRACT_SELL_OFFSET = 0
+    VELVETFRUIT_EXTRACT_TAKE_MARGIN = 5  # 0.31 sigma of std=16; prevents instant limit maxing
+
+    # EMA anchors: cold-start constants, updated each tick via slow EMA
+    ANCHOR_HYDROGEL    = 9991
+    ANCHOR_VE          = 5250
+    DELTA1_EMA_ALPHA      = 0.00003  # half-life ~23K ticks (~2.3 days)
+    HYDROGEL_RETREAT      = 6   # safe: bot spread=16, max bid-shift=6 < half-spread=8
+    VE_RETREAT            = 2   # safe: VE spread min=1 tick; retreat=2 → bid=wm-2+2=wm, never crosses ask
+
+    # VEV params kept for future passive-MM implementation; NOT dispatched this version
+    VEV_STRIKES              = [5000, 5100, 5200, 5300, 5400, 5500]
+    VEV_THRESHOLDS           = {5000: 0.009, 5100: 0.004, 5200: 0.002,
+                                5300: 0.002, 5400: 0.002, 5500: 0.003}
+    VEV_POS_CAP              = 25
+    VEV_IV_WINDOW            = 50
+    VEV_TREND_GUARD_K        = 5400
+    VEV_TREND_GUARD_THRESH   = 0.01
+    VEV_HEDGE_DELTA_THRESH   = 20.0
+    VEV_HEDGE_VE_BUDGET      = 30
+
     def bid(self):
         return self.MAF_BID
+
+    # TTE (time to expiry) schedule: end-of-day values in years
+    _TTE_END = {0: 8.0 / 365, 1: 7.0 / 365, 2: 6.0 / 365}
 
     def run(self, state: TradingState):
         result = {}
         conversions = 0
 
-        # BUG 2 FIX: json.loads("null") returns None; `or {}` guards that case
         data = (json.loads(state.traderData) if state.traderData else None) or {}
 
         if state.observations:
@@ -180,6 +217,28 @@ class Trader:
 
         if "INTARIAN_PEPPER_ROOT" in state.order_depths:
             result["INTARIAN_PEPPER_ROOT"] = self.strategy_ipr("INTARIAN_PEPPER_ROOT", state, data)
+
+        if "HYDROGEL_PACK" in state.order_depths:
+            result["HYDROGEL_PACK"] = self.strategy_delta1(
+                "HYDROGEL_PACK", state, data,
+                spread=self.HYDROGEL_PACK_SPREAD,
+                sell_offset=self.HYDROGEL_PACK_SELL_OFFSET,
+                take_margin=self.HYDROGEL_PACK_TAKE_MARGIN,
+                anchor_init=self.ANCHOR_HYDROGEL,
+                ema_alpha=self.DELTA1_EMA_ALPHA,
+                retreat=self.HYDROGEL_RETREAT,
+            )
+
+        if "VELVETFRUIT_EXTRACT" in state.order_depths:
+            result["VELVETFRUIT_EXTRACT"] = self.strategy_delta1(
+                "VELVETFRUIT_EXTRACT", state, data,
+                spread=self.VELVETFRUIT_EXTRACT_SPREAD,
+                sell_offset=self.VELVETFRUIT_EXTRACT_SELL_OFFSET,
+                take_margin=self.VELVETFRUIT_EXTRACT_TAKE_MARGIN,
+                anchor_init=self.ANCHOR_VE,
+                ema_alpha=self.DELTA1_EMA_ALPHA,
+                retreat=self.VE_RETREAT,
+            )
 
         traderData = json.dumps(data)
         return result, conversions, traderData
@@ -290,6 +349,174 @@ class Trader:
         if sell_budget > 0:
             orders.append(Order(product, ask_price, -int(sell_budget)))
         return orders
+
+    def strategy_delta1(self, product, state, data, *, spread, sell_offset, take_margin,
+                        anchor_init, ema_alpha=0.001, retreat=0):
+        """
+        Delta-1 MM with EMA-anchor split-FV + inventory-aversion (retreat).
+          take_fair    = EMA anchor (slow mean, cold-starts at anchor_init) — Phase 1 signal
+          passive_fair = wall_mid_blend — Phase 2 quote center
+          retreat      = inventory aversion coefficient; shifts Phase 2 quotes toward exit
+        At retreat=6, position=+limit: ask = wm-2 (aggressively attracts sellers to exit long).
+        Signs: sell_orders values NEGATIVE; Order qty positive=buy, negative=sell.
+        """
+        depth = state.order_depths[product]
+        init_product_data(data, product, {"last_wm": None, "anchor": anchor_init})
+
+        wm = compute_wall_mid_blend(depth)
+        if wm is not None:
+            data[product]["last_wm"] = wm
+        else:
+            wm = data[product].get("last_wm")
+        if wm is None:
+            return []
+
+        if not depth.buy_orders or not depth.sell_orders:
+            return []
+
+        position = state.position.get(product, 0)
+        limit = self.LIMITS.get(product)
+        if limit is None:
+            return []
+
+        data[product]["anchor"] = (1 - ema_alpha) * data[product]["anchor"] + ema_alpha * wm
+
+        take_fair    = data[product]["anchor"]
+        passive_fair = wm
+
+        buy_budget  = limit - position
+        sell_budget = limit + position
+        orders = []
+
+        # Phase 1a: take asks below take_fair - take_margin (mean-revert buy)
+        for price in sorted(depth.sell_orders.keys()):
+            if price <= take_fair - take_margin and buy_budget > 0:
+                available = -depth.sell_orders[price]
+                qty = min(available, buy_budget)
+                if qty > 0:
+                    orders.append(Order(product, int(price), int(qty)))
+                    buy_budget -= qty
+
+        # Phase 1b: take bids above take_fair + take_margin + sell_offset (mean-revert sell)
+        for price in sorted(depth.buy_orders.keys(), reverse=True):
+            if price >= take_fair + take_margin + sell_offset and sell_budget > 0:
+                available = depth.buy_orders[price]
+                qty = min(available, sell_budget)
+                if qty > 0:
+                    orders.append(Order(product, int(price), -int(qty)))
+                    sell_budget -= qty
+
+        # Phase 2: inventory-aversion passive quotes
+        # inv_adjust > 0 when long: shifts quotes DOWN (lower ask = easier to exit long)
+        # inv_adjust < 0 when short: shifts quotes UP (higher bid = easier to exit short)
+        inv_adjust = retreat * position / limit if limit > 0 else 0
+        adjusted_fair = passive_fair - inv_adjust
+        bid_price = int(math.floor(adjusted_fair - spread))
+        ask_price = int(math.ceil(adjusted_fair + spread + sell_offset))
+        if buy_budget > 0:
+            orders.append(Order(product, bid_price, int(buy_budget)))
+        if sell_budget > 0:
+            orders.append(Order(product, ask_price, -int(sell_budget)))
+
+        return orders
+
+    def strategy_vev_batch(self, state, data, tte):
+        """
+        IV mean-reversion across 6 ATM strikes (5000-5500) with net-delta hedge via VE.
+        Returns {voucher: [orders], "__ve_hedge__": [orders]} where present.
+        Caller merges __ve_hedge__ with VE MM orders before adding to result.
+        """
+        ve_depth = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if not ve_depth or not ve_depth.buy_orders or not ve_depth.sell_orders:
+            return {}
+        ve_bid = max(ve_depth.buy_orders.keys())
+        ve_ask = min(ve_depth.sell_orders.keys())
+        S = (ve_bid + ve_ask) / 2.0
+        ve_half_spread = (ve_ask - ve_bid) / 2.0
+
+        result = {}
+        net_delta_new = 0.0  # delta contribution from orders placed this tick
+
+        for K in self.VEV_STRIKES:
+            voucher = "VEV_{}".format(K)
+            v_depth = state.order_depths.get(voucher)
+            if not v_depth or not v_depth.buy_orders or not v_depth.sell_orders:
+                continue
+            v_bid = max(v_depth.buy_orders.keys())
+            v_ask = min(v_depth.sell_orders.keys())
+            option_mid = (v_bid + v_ask) / 2.0
+
+            iv = implied_vol(option_mid, S, K, tte, 0)
+            if iv is None:
+                continue
+
+            init_product_data(data, voucher, {"iv_history": []})
+            append_capped(data[voucher]["iv_history"], round(iv, 6), self.VEV_IV_WINDOW)
+            iv_hist = data[voucher]["iv_history"]
+            if len(iv_hist) < 20:
+                continue
+
+            # K=5400: skip when IV has trended > 1% over last 50 samples
+            if K == self.VEV_TREND_GUARD_K and len(iv_hist) >= self.VEV_IV_WINDOW:
+                if abs(iv_hist[-1] - iv_hist[-self.VEV_IV_WINDOW]) > self.VEV_TREND_GUARD_THRESH:
+                    continue
+
+            mean_iv = sum(iv_hist) / len(iv_hist)
+            threshold = self.VEV_THRESHOLDS[K]
+            delta = bs_delta(S, K, tte, 0, iv)
+            v_pos = state.position.get(voucher, 0)
+            cap = self.VEV_POS_CAP
+            lim = self.LIMITS.get(voucher, 300)
+
+            if iv > mean_iv + threshold:
+                # IV elevated: sell voucher (short vega)
+                can_sell = min(cap + v_pos, lim + v_pos)
+                if can_sell > 0:
+                    qty = min(can_sell, 5)
+                    result[voucher] = [Order(voucher, int(v_bid), -int(qty))]
+                    net_delta_new -= delta * qty  # short call = short delta
+
+            elif iv < mean_iv - threshold:
+                # IV depressed: buy voucher (long vega)
+                can_buy = min(cap - v_pos, lim - v_pos)
+                if can_buy > 0:
+                    qty = min(can_buy, 5)
+                    result[voucher] = [Order(voucher, int(v_ask), int(qty))]
+                    net_delta_new += delta * qty  # long call = long delta
+
+        # Net-delta hedge via VE when threshold crossed and spread acceptable
+        if abs(net_delta_new) > 0 and ve_half_spread <= 3.0:
+            # Existing VEV portfolio delta
+            existing_delta = 0.0
+            for K in self.VEV_STRIKES:
+                vk_pos = state.position.get("VEV_{}".format(K), 0)
+                if vk_pos == 0:
+                    continue
+                vk_depth = state.order_depths.get("VEV_{}".format(K))
+                if not vk_depth or not vk_depth.buy_orders or not vk_depth.sell_orders:
+                    continue
+                vk_mid = (max(vk_depth.buy_orders.keys()) + min(vk_depth.sell_orders.keys())) / 2.0
+                vk_iv = implied_vol(vk_mid, S, K, tte, 0)
+                if vk_iv:
+                    existing_delta += vk_pos * bs_delta(S, K, tte, 0, vk_iv)
+
+            total_delta = existing_delta + net_delta_new
+            if abs(total_delta) > self.VEV_HEDGE_DELTA_THRESH:
+                desired_ve_target = -round(total_delta)
+                ve_pos = state.position.get("VELVETFRUIT_EXTRACT", 0)
+                hedge_change = desired_ve_target - ve_pos
+                ve_lim = self.LIMITS.get("VELVETFRUIT_EXTRACT", 200)
+                budget = self.VEV_HEDGE_VE_BUDGET
+                if hedge_change > 0:
+                    qty = min(hedge_change, budget, ve_lim - ve_pos)
+                    if qty > 0:
+                        result["__ve_hedge__"] = [Order("VELVETFRUIT_EXTRACT", int(ve_ask), int(qty))]
+                elif hedge_change < 0:
+                    qty = min(-hedge_change, budget, ve_lim + ve_pos)
+                    if qty > 0:
+                        result["__ve_hedge__"] = [Order("VELVETFRUIT_EXTRACT", int(ve_bid), -int(qty))]
+
+        return result
 
     def strategy_ema(self, product, state, data):
         init_product_data(data, product, {"ema": None})

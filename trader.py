@@ -173,15 +173,15 @@ class Trader:
     # R3 delta-1 MM params
     HYDROGEL_PACK_SPREAD       = 4
     HYDROGEL_PACK_SELL_OFFSET  = 0
-    HYDROGEL_PACK_TAKE_MARGIN  = 8   # 0.27 sigma of std=30; prevents false takes on anchor error
+    HYDROGEL_PACK_TAKE_MARGIN  = 10  # sweep-optimized: sym 33.9%/33.1% on live, fires at peak ts=68800
 
     VELVETFRUIT_EXTRACT_SPREAD      = 2
     VELVETFRUIT_EXTRACT_SELL_OFFSET = 0
-    VELVETFRUIT_EXTRACT_TAKE_MARGIN = 5  # 0.31 sigma of std=16; prevents instant limit maxing
+    VELVETFRUIT_EXTRACT_TAKE_MARGIN = 7  # sweep-optimized: sym 10.3%/12.7% on live, cascade SAFE
 
     # EMA anchors: cold-start constants, updated each tick via slow EMA
-    ANCHOR_HYDROGEL    = 9991
-    ANCHOR_VE          = 5250
+    ANCHOR_HYDROGEL    = 9976  # sweep-optimized around live mean 9979
+    ANCHOR_VE          = 5262  # calibrated to live day mean (confirmed from 375207+376559)
     DELTA1_EMA_ALPHA      = 0.00003  # half-life ~23K ticks (~2.3 days)
     HYDROGEL_RETREAT      = 6   # safe: bot spread=16, max bid-shift=6 < half-spread=8
     VE_RETREAT            = 2   # safe: VE spread min=1 tick; retreat=2 → bid=wm-2+2=wm, never crosses ask

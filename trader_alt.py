@@ -274,6 +274,7 @@ class Trader:
                 ema_alpha=self.DELTA1_EMA_ALPHA,
                 retreat=self.HYDROGEL_RETREAT,
                 mark_lean=lean,
+                fixed_take_fair=10000,
             )
 
         # ── VE: day-aware parameters ───────────────────────────────────────
@@ -287,22 +288,11 @@ class Trader:
             else:
                 ve_take_margin = 100
                 ve_plc = 0
-            result["VELVETFRUIT_EXTRACT"] = self.strategy_delta1(
-                "VELVETFRUIT_EXTRACT", state, data,
-                spread=self.VELVETFRUIT_EXTRACT_SPREAD,
-                sell_offset=self.VELVETFRUIT_EXTRACT_SELL_OFFSET,
-                take_margin=ve_take_margin,
-                anchor_init=self.ANCHOR_VE,
-                ema_alpha=self.DELTA1_EMA_ALPHA,
-                retreat=self.VE_RETREAT,
-                mark_lean=lean,
-                passive_long_cap=ve_plc,
-            )
-
+            result["VELVETFRUIT_EXTRACT"] = self.strategy_ve_directional_short(state,data)
         # ── Intrinsic MM on deep-ITM strikes ───────────────────────────────
-        vev_mm_orders = self.strategy_vev_intrinsic_mm(state, data, mark_signals)
-        for k, v in vev_mm_orders.items():
-            result[k] = v
+        # vev_mm_orders = self.strategy_vev_intrinsic_mm(state, data, mark_signals)
+        # for k, v in vev_mm_orders.items():
+        #     result[k] = v
 
         # ── Settlement: LONG on D1/D2 (VE rising), SHORT on D3 (VE falling)
         if tte is not None and tte > 0:
@@ -586,8 +576,42 @@ class Trader:
     # R3+ STRATEGIES
     # ──────────────────────────────────────────────────────────────────────────
 
+    def strategy_ve_directional_short(self, state, data):
+        """
+        Day 3 thesis: VE bleeds with options expiry. Aggressively short to -200.
+        Pairs with settlement_short net delta to compound directional gain.
+        Risk: VE rally > 100 ticks. Accepted (matches user 'be ballsy' directive).
+        """
+        product = "VELVETFRUIT_EXTRACT"
+        depth = state.order_depths.get(product)
+        if not depth or not depth.buy_orders:
+            return []
+        position = state.position.get(product, 0)
+        limit = self.LIMITS[product]
+        sell_budget = limit + position
+        if sell_budget <= 0:
+            return []
+
+        orders = []
+        # Take from bid aggressively to build short fast
+        ENTRY_QTY = 25
+        remaining = sell_budget
+        for price in sorted(depth.buy_orders.keys(), reverse=True):
+            if remaining <= 0:
+                break
+            avail = depth.buy_orders[price]
+            qty = min(avail, remaining, ENTRY_QTY)
+            if qty > 0:
+                orders.append(Order(product, int(price), -int(qty)))
+                remaining -= qty
+                ENTRY_QTY -= qty
+                if ENTRY_QTY <= 0:
+                    break
+        return orders
+
     def strategy_delta1(self, product, state, data, *, spread, sell_offset, take_margin,
-                        anchor_init, ema_alpha=0.001, retreat=0, mark_lean=0.0, passive_long_cap=None):
+                    anchor_init, ema_alpha=0.001, retreat=0, mark_lean=0.0,
+                    passive_long_cap=None, fixed_take_fair=None):
         """
         Delta-1 MM with EMA-anchor split-FV + inventory-aversion + Mark lean overlay.
           take_fair    = EMA anchor + mark_lean (ticks of bias)
@@ -616,13 +640,23 @@ class Trader:
 
         # Cold-start anchor from first wall_mid, not hardcoded constant.
         # Hardcoded 9976 vs R4 actual mean 10033 caused 57-tick gap -> -4681 HYDROGEL loss.
-        if data[product]["anchor"] is None:
-            data[product]["anchor"] = wm
-        data[product]["anchor"] = (1 - ema_alpha) * data[product]["anchor"] + ema_alpha * wm
+        if fixed_take_fair is not None:
+            take_fair = fixed_take_fair + mark_lean
+            if data[product]["anchor"] is None:
+                data[product]["anchor"] = fixed_take_fair
+        else:
+            if data[product]["anchor"] is None:
+                data[product]["anchor"] = wm
+            data[product]["anchor"] = (1 - ema_alpha) * data[product]["anchor"] + ema_alpha * wm
+            take_fair = data[product]["anchor"] + mark_lean
 
         # Mark lean shifts take_fair: bullish lean = willing to BUY higher / SELL higher
-        take_fair    = data[product]["anchor"] + mark_lean
+        #take_fair    = data[product]["anchor"] + mark_lean
         passive_fair = wm
+
+        ANCHOR_LAG_GUARD = 8
+        anchor_lag = abs(data[product]["anchor"] - wm)
+        takes_disabled = anchor_lag > ANCHOR_LAG_GUARD
 
         buy_budget  = limit - position
         sell_budget = limit + position
@@ -631,7 +665,7 @@ class Trader:
         # Phase 1a: take asks below take_fair - take_margin (mean-revert buy)
         # Guard: skip if at max long. Prevents catching falling knife at position ceiling.
         at_max_long = position >= (limit - 5)
-        if not at_max_long:
+        if not at_max_long and not takes_disabled:
             for price in sorted(depth.sell_orders.keys()):
                 if price <= take_fair - take_margin and buy_budget > 0:
                     available = -depth.sell_orders[price]
@@ -648,7 +682,7 @@ class Trader:
         # Set to 0 for VE to eliminate all passive buys on falling market.
         _plc = passive_long_cap if passive_long_cap is not None else (limit - 5)
         at_max_long_passive = position >= _plc
-        if not at_max_short:
+        if not at_max_short and not takes_disabled:
             for price in sorted(depth.buy_orders.keys(), reverse=True):
                 if price >= take_fair + take_margin + sell_offset and sell_budget > 0:
                     available = depth.buy_orders[price]
@@ -863,6 +897,8 @@ class Trader:
         # These are calibrated to this round's observed prices. Update if re-running on
         # different round data. The logic: we only lose at expiry if VE > K + what we sold for.
         EXIT_VE = {
+            4000: 5350,   # sold ~1296, break-even 5296, +54 buffer
+            4500: 5350,
             5000: 5290,   # VE starts at 5295; only enter after it falls 5+ ticks
             5100: 5315,
             5200: 5330,
@@ -870,7 +906,7 @@ class Trader:
             5400: 5425,
             5500: 5510,
         }
-        TARGETS = {5000: -300, 5100: -300, 5200: -300, 5300: -300, 5400: -300, 5500: -300}
+        TARGETS = {4000: -300, 4500: -300,5000: -300, 5100: -300, 5200: -300, 5300: -300, 5400: -300, 5500: -300}
         ENTRY_QTY = 30
 
         out = {}
@@ -995,7 +1031,7 @@ class Trader:
         if not state.market_trades:
             return {}
         result = {}
-        for product in ("HYDROGEL_PACK", "VEV_4000"):
+        for product in ("HYDROGEL_PACK"):
             if product not in state.order_depths or product not in self.LIMITS:
                 continue
             depth = state.order_depths[product]
@@ -1031,7 +1067,7 @@ class Trader:
         if not state.market_trades:
             return {}
         result = {}
-        for product in ("HYDROGEL_PACK", "VEV_4000"):
+        for product in ("HYDROGEL_PACK"):
             depth = state.order_depths.get(product)
             if not depth or not depth.sell_orders:
                 continue
